@@ -135,6 +135,33 @@ Return exactly one JSON object with keys: invoice_number, invoice_date, supplier
 # ---------- API ----------
 @app.get("/health")
 def health(): return {"ok": True}
+import os, httpx
+
+@app.get("/check-openai")
+def check_openai():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "OPENAI_API_KEY not set in environment"}
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [{"role":"user","content":"ping"}],
+        "max_tokens": 5,
+        "temperature": 0
+    }
+
+    try:
+        r = httpx.post("https://api.openai.com/v1/chat/completions",
+                       headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        return {"ok": True, "echo": txt}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/ingest")
 async def ingest(files: list[UploadFile] = File(...)):
