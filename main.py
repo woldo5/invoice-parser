@@ -1,103 +1,118 @@
-import io, zipfile, re, os
+import io, zipfile, re, os, json, httpx
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from datetime import datetime
 import fitz  # PyMuPDF
 from supabase import create_client, Client
 
 app = FastAPI()
 
+# ---------- CONFIG ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE")
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+sb = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
+# ---------- Lightweight helpers ----------
 MONEY = re.compile(r"^\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})-?$")
-INT   = re.compile(r"^\d{1,4}$")
-CODE  = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-\/\.]*$")
+INT   = re.compile(r"^\d{1,5}$")
 
 def norm_date(s:str)->str:
-    for fmt in ("%Y-%m-%d","%m/%d/%Y","%m/%d/%y"):
+    for fmt in ("%Y-%m-%d","%m/%d/%Y","%m/%d/%y","%d-%b-%Y"):
         try: return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except: pass
     return ""
 
-def invnum(t:str, fname:str):
-    m = re.search(r"\b(\d{6,9}-\d{2})\b", t)
+def invnum_guess(text:str, fname:str):
+    m = re.search(r"\bINV(?:OICE)?\s*#?\s*([A-Z0-9\-]{6,})\b", text, re.I)
     if m: return m.group(1)
-    m = re.search(r"\bINV(?:OICE)?\s*#?\s*([A-Z0-9\-]{6,})\b", t, re.I)
+    m = re.search(r"\b(\d{6,9}-\d{2})\b", text)
     if m: return m.group(1)
     return os.path.splitext(os.path.basename(fname))[0]
 
-def invdate(t:str, fname:str):
-    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", t)
+def invdate_guess(text:str, fname:str):
+    # in-text
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", text);      # 2025-08-28
     if m: return m.group(1)
-    m = re.search(r"\b(\d{2}/\d{2}/\d{2,4})\b", t)
+    m = re.search(r"(\d{2}/\d{2}/\d{2,4})", text);    # 08/28/2025
     if m: return norm_date(m.group(1))
+    # filename fallback ..._YYYYMMDD_...
     m = re.search(r"_(20\d{2})(\d{2})(\d{2})_", fname)
     if m: y,mm,dd=m.groups(); return f"{y}-{mm}-{dd}"
     return ""
 
-def supplier_name(t:str):
-    return "Noble" if re.search(r"\bNoble\b", t, re.I) else ""
+def page_text_sample(page, max_chars=2000):
+    # Get structured text with line breaks; trim to keep prompts small
+    t = page.get_text("text")
+    return t[:max_chars]
 
-def words_to_lines(words, y_tol=1.4):
-    words = sorted(words, key=lambda w: (round(w[1],1), w[0]))
-    lines=[]; cur=[]; cury=None
-    for w in words:
-        y=w[1]
-        if cury is None or abs(y-cury)<=y_tol:
-            cur.append(w); cury=y if cury is None else cury
-        else:
-            lines.append(sorted(cur, key=lambda t:t[0])); cur=[w]; cury=y
-    if cur: lines.append(sorted(cur, key=lambda t:t[0]))
-    return lines
+def supplier_guess(text:str):
+    # first non-empty uppercase-ish line is a decent guess
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if len(ln) >= 3:
+            return ln[:60]
+    return ""
 
-def money_val(s):
-    s=s.replace("$","").replace(",","").strip()
-    neg = s.endswith("-")
-    if neg: s=s[:-1]
-    try: v=float(s); return -v if neg else v
-    except: return None
+# ---------- AI normalizer ----------
+AI_SYSTEM = (
+"You're an invoice line-item normalizer. "
+"Given invoice text (any layout/columns), return ONLY JSON with this exact shape:\n"
+"{\"invoice_number\":\"\",\"invoice_date\":\"YYYY-MM-DD\",\"supplier\":\"\","
+" \"lines\":[{\"item_code\":\"\",\"item_name\":\"\",\"quantity\":0,\"unit_price\":0.0,\"line_total\":0.0}]}\n"
+"- Map any column names (SKU, Part, Code, Description, Qty, QTY, Quantity, Price, Unit, Ext, Amount, Total) into the schema.\n"
+"- If description is on the NEXT LINE under the code and that line has no money, use it as item_name.\n"
+"- Quantities must be integers; prices/totals are numbers. No currency symbols.\n"
+"- Validate math if possible: line_total ~= quantity * unit_price. If unclear, still return best guess.\n"
+"- If it's a statement or has no line-items, return lines: [].\n"
+"- Never include commentary—ONLY the JSON object."
+)
 
-def parse_items(page):
-    out=[]
-    lines = words_to_lines(page.get_text("words"))
-    for i, line in enumerate(lines):
-        toks=[w[4] for w in line]
-        if not toks: continue
-        mpos = [k for k,t in enumerate(toks) if MONEY.match(t)]
-        if not mpos: continue
-        total_i = mpos[-1]; total_txt = toks[total_i]
-        unit_i = next((k for k in range(total_i-1,-1,-1) if MONEY.match(toks[k])), None)
-        if unit_i is None: continue
-        qty_i = next((k for k in range(unit_i-1,-1,-1) if INT.match(toks[k])), None)
-        if qty_i is None: continue
-        code_i = 0
-        if INT.match(toks[0]) and len(toks)>1: code_i=1
-        code = toks[code_i].strip()
-        if not CODE.match(code): continue
+def call_openai_normalize(text_block:str, fname:str):
+    """
+    Send a compact prompt to the AI to normalize the invoice page to our schema.
+    """
+    user_prompt = f"""
+FILENAME: {fname}
+EXTRACTED_TEXT:
+\"\"\"
+{text_block}
+\"\"\"
+Return exactly one JSON object with keys: invoice_number, invoice_date, supplier, lines[].
+"""
+    # Use the Chat Completions API via HTTPX to avoid extra libs
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4.1-mini",  # cost-effective; upgrade if needed
+        "messages": [
+            {"role":"system", "content": AI_SYSTEM},
+            {"role":"user", "content": user_prompt}
+        ],
+        "temperature": 0.1
+    }
+    try:
+        with httpx.Client(timeout=60) as client:
+            resp = client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            # content should be just JSON; be defensive:
+            start = content.find("{"); end = content.rfind("}")
+            if start >= 0 and end >= 0:
+                content = content[start:end+1]
+            data = json.loads(content)
+            # Hard guard keys
+            data.setdefault("invoice_number","")
+            data.setdefault("invoice_date","")
+            data.setdefault("supplier","")
+            data.setdefault("lines",[])
+            return data
+    except Exception as e:
+        return {"invoice_number":"", "invoice_date":"", "supplier":"", "lines":[], "error": str(e)}
 
-        # Name under code if next line has no money tokens
-        item_name = ""
-        if i+1 < len(lines):
-            nxt = [w[4] for w in lines[i+1]]
-            if not any(MONEY.match(t) for t in nxt):
-                item_name = " ".join(nxt).strip(" -/")
-
-        if not item_name:
-            qty_x0 = line[qty_i][0]; code_x1 = line[code_i][2]
-            seg = [w[4] for w in line if (w[0] >= code_x1-1 and w[2] <= qty_x0+1)]
-            item_name = " ".join(seg[1:]).strip(" -/") if len(seg)>1 else ""
-
-        try:
-            qty  = int(toks[qty_i].replace(",",""))
-            unit = money_val(toks[unit_i]); tot = money_val(total_txt)
-            if unit is None or tot is None or qty<=0: continue
-            if abs(qty*unit - tot) > 0.25*max(abs(tot),1.0): continue
-            out.append((code.lower(), item_name, qty, unit, tot))
-        except: pass
-    return out
-
+# ---------- API ----------
 @app.get("/health")
 def health(): return {"ok": True}
 
@@ -113,66 +128,88 @@ async def ingest(files: list[UploadFile] = File(...)):
                 for name in z.namelist():
                     if not name.lower().endswith(".pdf"): continue
                     files_count += 1
-                    pdf = io.BytesIO(z.read(name))
-                    try: doc = fitz.open(stream=pdf, filetype="pdf")
+                    pdf_bytes = z.read(name)
+                    try:
+                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                     except Exception as e:
                         errors.append(f"{name}: pdf open failed {e}"); continue
 
-                    text_all = "\n".join(p.get_text("text") for p in doc)
-                    inv_no = invnum(text_all, name)
-                    inv_date = invdate(text_all, name)
-                    supp = supplier_name(text_all)
-                    if inv_no in seen_invoices:
-                        doc.close(); continue
-                    seen_invoices.add(inv_no)
-
-                    total_cost=0; total_qty=0; item_ct=0
+                    # --- collect AI-normalized lines across pages ---
+                    combined = {"invoice_number":"", "invoice_date":"", "supplier":"", "lines":[]}
                     for p in doc:
-                        for code, nm, qty, unit, tot in parse_items(p):
-                            item_ct += 1
-                            total_cost += tot
-                            total_qty  += qty
+                        text_block = page_text_sample(p)
+                        ai = call_openai_normalize(text_block, os.path.basename(name))
+                        # fill missing header fields progressively
+                        if not combined["invoice_number"]: combined["invoice_number"] = ai.get("invoice_number") or ""
+                        if not combined["invoice_date"]:   combined["invoice_date"]   = ai.get("invoice_date") or ""
+                        if not combined["supplier"]:       combined["supplier"]       = ai.get("supplier") or ""
+                        # append lines
+                        for ln in ai.get("lines", []):
+                            # soft validation + casting
+                            try:
+                                q  = int(str(ln.get("quantity","0")).replace(",",""))
+                            except: q = 0
+                            try:
+                                up = float(str(ln.get("unit_price","0")).replace(",",""))
+                            except: up = 0.0
+                            try:
+                                lt = float(str(ln.get("line_total","0")).replace(",",""))
+                            except: lt = 0.0
                             parsed_lines.append({
-                                "supplier": supp,
-                                "invoice_number": inv_no,
-                                "invoice_date": inv_date,
-                                "item_code": code,
-                                "item_name": nm,
-                                "quantity": qty,
-                                "unit_price": round(unit,2),
-                                "line_total": round(tot,2),
+                                "supplier": combined["supplier"] or supplier_guess(text_block),
+                                "invoice_number": combined["invoice_number"] or invnum_guess(text_block, name),
+                                "invoice_date": norm_date(combined["invoice_date"]) or invdate_guess(text_block, name),
+                                "item_code": (ln.get("item_code") or "").strip().lower(),
+                                "item_name": (ln.get("item_name") or "").strip(),
+                                "quantity": q,
+                                "unit_price": round(up,2),
+                                "line_total": round(lt,2),
                                 "file_name": os.path.basename(name)
                             })
                     doc.close()
-                    if item_ct>0:
+
+                    inv_no   = combined["invoice_number"] or invnum_guess("", name)
+                    inv_date = norm_date(combined["invoice_date"]) or invdate_guess("", name)
+                    supp     = combined["supplier"]
+
+                    if inv_no in seen_invoices:
+                        continue
+                    seen_invoices.add(inv_no)
+
+                    # compute invoice totals from parsed lines for this invoice
+                    inv_lines = [r for r in parsed_lines if r["invoice_number"] == inv_no]
+                    if inv_lines:
+                        total_qty = sum(r["quantity"] for r in inv_lines)
+                        total_val = round(sum(r["line_total"] for r in inv_lines),2)
                         invoices_rows.append({
                             "supplier": supp,
                             "invoice_number": inv_no,
                             "invoice_date": inv_date or None,
                             "lines": total_qty,
-                            "total_value": round(total_cost,2),
+                            "total_value": total_val,
                             "file_name": os.path.basename(name)
                         })
         except Exception as e:
             errors.append(f"{f.filename}: zip read failed {e}")
 
-    # Upsert to Supabase
-    if invoices_rows:
-        sb.table("invoices").upsert(invoices_rows, on_conflict="invoice_number").execute()
-    if parsed_lines:
-        sb.table("items").insert(parsed_lines).execute()
+    # Push to Supabase (optional but recommended)
+    if sb:
+        if invoices_rows:
+            sb.table("invoices").upsert(invoices_rows, on_conflict="invoice_number").execute()
+        if parsed_lines:
+            # avoid accidental dup inserts: optional—could add a unique constraint later
+            sb.table("items").insert(parsed_lines).execute()
 
-    # Build master/monthly for convenience (client can also query Supabase view)
-    # Master
-    from collections import defaultdict
-    by = defaultdict(lambda: {"qty":0,"val":0,"invs":set(),"name_counts":{}, "first":"","last":""})
+    # Build quick rollups for UI
+    from collections import defaultdict, Counter
+    by = defaultdict(lambda: {"qty":0,"val":0,"invs":set(),"names":{}, "first":"","last":""})
     for r in parsed_lines:
         k = r["item_code"]
         by[k]["qty"] += r["quantity"]
         by[k]["val"] += r["line_total"]
         if r["invoice_number"]: by[k]["invs"].add(r["invoice_number"])
-        nm=r["item_name"].strip() if r["item_name"] else ""
-        if nm: by[k]["name_counts"][nm]=by[k]["name_counts"].get(nm,0)+1
+        nm=(r["item_name"] or "").strip()
+        if nm: by[k]["names"][nm]=by[k]["names"].get(nm,0)+1
         d=r["invoice_date"] or ""
         if d:
             by[k]["first"] = min(filter(None,[by[k]["first"],d])) if by[k]["first"] else d
@@ -185,7 +222,7 @@ async def ingest(files: list[UploadFile] = File(...)):
 
     master=[]
     for k,v in by.items():
-        best_name = sorted(v["name_counts"].items(), key=lambda t:t[1], reverse=True)[0][0] if v["name_counts"] else ""
+        best_name = sorted(v["names"].items(), key=lambda t:t[1], reverse=True)[0][0] if v["names"] else ""
         invs=len(v["invs"]); span=months_between(v["first"], v["last"])
         master.append({
             "item_code": k,
@@ -199,20 +236,16 @@ async def ingest(files: list[UploadFile] = File(...)):
         })
     master.sort(key=lambda r:r["total_value"], reverse=True)
 
-    # Monthly summary
-    from collections import Counter
-    monthly_counter_q = Counter()
-    monthly_counter_v = Counter()
+    monthly_q = Counter(); monthly_v = Counter()
     for r in parsed_lines:
         m = (r["invoice_date"] or "")[:7]
         if len(m)==7:
-            monthly_counter_q[m] += r["quantity"]
-            monthly_counter_v[m] += r["line_total"]
-    months = sorted(monthly_counter_q.keys())
-    monthly=[]
-    prev_q=prev_v=None
+            monthly_q[m] += r["quantity"]
+            monthly_v[m] += r["line_total"]
+    months = sorted(monthly_q.keys())
+    monthly=[]; prev_q=prev_v=None
     for m in months:
-        q=monthly_counter_q[m]; v=round(monthly_counter_v[m],2)
+        q=monthly_q[m]; v=round(monthly_v[m],2)
         row={"invoice_month":m,"total_quantity":q,"total_value":v,"qty_mom_pct":None,"val_mom_pct":None}
         if prev_q not in (None,0): row["qty_mom_pct"]=round((q-prev_q)/prev_q,3)
         if prev_v not in (None,0): row["val_mom_pct"]=round((v-prev_v)/prev_v,3)
@@ -222,7 +255,7 @@ async def ingest(files: list[UploadFile] = File(...)):
         "parsed_lines": parsed_lines,
         "master": master,
         "monthly": monthly,
-        "oddities": [],  # add later if you want
+        "oddities": [],   # can add later
         "files_processed": files_count,
         "errors": errors
     })
