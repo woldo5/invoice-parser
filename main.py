@@ -7,6 +7,26 @@ from supabase import create_client, Client
 
 app = FastAPI()
 
+import os, httpx
+
+@app.get("/check-openai")
+def check_openai():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "OPENAI_API_KEY not set in environment"}
+    try:
+        r = httpx.post(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
+            timeout=20
+        )
+        r.raise_for_status()
+        data = r.json()
+        first = data["data"][0]["id"] if "data" in data and data["data"] else None
+        return {"ok": True, "first_model": first}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # ---------- CONFIG ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE")
