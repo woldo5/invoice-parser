@@ -4,3 +4,4 @@ pymupdf==1.24.9
 python-multipart
 supabase
 httpx
+pydantic>=2
